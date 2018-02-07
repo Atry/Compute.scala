@@ -398,7 +398,7 @@ trait Tensors extends OpenCL {
               compiledKernel
             }
           }
-          kernelCache.get(float.factory.newInstance(convertedTree.asInstanceOf[float.Tree]), loader)
+          kernelCache.get(float.factory.newInstance(convertedTree.asInstanceOf[FloatTerm#Tree]), loader)
         case compiledKernel =>
           compiledKernel
       }

@@ -164,13 +164,10 @@ trait Trees extends Expressions {
 
   final class ExportContext extends IdentityHashMap[TreeApi, Any]
 
-  protected trait ExpressionApi extends super.ExpressionApi { thisExpression =>
+  protected trait TermApi extends super.TermApi { thisTerm: Term =>
     type Tree = TreeApi {
-      type TermIn[C <: Category] = thisExpression.TermIn[C]
+      type TermIn[C <: Category] = thisTerm.TermIn[C]
     }
-  }
-
-  protected trait TermApi extends ExpressionApi with super.TermApi { thisTree: Term =>
 
     def alphaConversion: ThisTerm
 
@@ -184,9 +181,6 @@ trait Trees extends Expressions {
 
   type Term <: TermApi
 
-  protected trait TypeApi extends ExpressionApi with super.TypeApi
-  type Type <: TypeApi
-
 }
 
 object Trees {
@@ -195,20 +189,6 @@ object Trees {
     * @author 杨博 (Yang Bo)
     */
   trait ValueTrees extends Values with Trees {
-
-    protected trait ValueTypeApi extends super.ValueTypeApi {
-
-      override def equals(that: scala.Any): Boolean = {
-        that != null && that.getClass == this.getClass
-      }
-
-      def in(foreignCategory: Category): TypeIn[foreignCategory.type]
-
-      def factory: Factory1[TreeApi { type TermIn[C <: Category] = ThisTerm#TermIn[C] }, ThisTerm]
-
-    }
-
-    type ValueType <: (Type with Any) with ValueTypeApi
 
     protected trait ValueTermApi extends TermApi with super.ValueTermApi { thisValue: ValueTerm =>
 
@@ -251,7 +231,7 @@ object Trees {
     */
   trait FloatTrees extends Floats with ValueTrees {
 
-    protected trait FloatTermApi extends super.FloatTermApi with ValueTermApi with FloatExpressionApi {
+    protected trait FloatTermApi extends super.FloatTermApi with ValueTermApi {
       thisFloat: FloatTerm =>
 
       def factory: Factory1[TreeApi { type TermIn[C <: Category] = C#FloatTerm }, ThisTerm] = {
@@ -440,10 +420,7 @@ object Trees {
       }
     }
 
-    protected trait FloatTypeApi extends ValueTypeApi with super.FloatTypeApi with FloatExpressionApi {
-      def in(foreignCategory: Category): TypeIn[foreignCategory.type] = {
-        foreignCategory.float
-      }
+    protected trait FloatSingletonApi extends ValueSingletonApi with super.FloatSingletonApi {
 
       def literal(value: Float): FloatTerm = {
         factory.newInstance(FloatLiteral(value))
@@ -456,12 +433,9 @@ object Trees {
       @inject
       def factory: Factory1[TreeApi { type TermIn[C <: Category] = ThisTerm#TermIn[C] }, ThisTerm]
 
-      override def hashCode(): Int = {
-        "float".##
-      }
     }
 
-    type FloatType <: (ValueType with Any) with FloatTypeApi
+    type FloatSingleton <: (ValueSingleton with Any) with FloatSingletonApi
 
   }
 

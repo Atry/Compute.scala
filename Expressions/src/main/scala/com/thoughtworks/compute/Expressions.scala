@@ -12,22 +12,14 @@ import scala.language.higherKinds
 trait Expressions {
   type Category >: this.type <: Expressions
 
-  protected trait ExpressionApi {
+  protected trait TermApi { this: Term =>
     type TermIn[C <: Category] <: C#Term
 
     type ThisTerm = TermIn[Expressions.this.type]
 
   }
 
-  protected trait TermApi extends ExpressionApi { this: Term =>
-
-  }
-
   type Term <: TermApi
-
-  protected trait TypeApi extends ExpressionApi
-
-  type Type <: TypeApi
 
 }
 
@@ -54,23 +46,17 @@ object Expressions {
   trait Values extends Expressions {
     type Category >: this.type <: Values
 
-    protected trait ValueExpressionApi extends ExpressionApi { thisValue =>
-
-      type JvmValue
+    protected trait ValueTermApi extends TermApi { this: ValueTerm =>
       type TermIn[C <: Category] <: C#ValueTerm
-      type TypeIn[C <: Category] <: C#ValueType {
-        type JvmValue = thisValue.JvmValue
-      }
-      type ThisType = TypeIn[Values.this.type]
-    }
-
-    protected trait ValueTermApi extends TermApi with ValueExpressionApi { this: ValueTerm =>
     }
 
     /** @template */
     type ValueTerm <: (Term with Any) with ValueTermApi
 
-    protected trait ValueTypeApi extends ValueExpressionApi {
+    protected trait ValueSingletonApi {
+
+      type JvmValue
+      type ThisTerm <: ValueTerm
 
       def literal(value: JvmValue): ThisTerm
 
@@ -78,7 +64,7 @@ object Expressions {
 
     }
 
-    type ValueType <: (Type with Any) with ValueTypeApi
+    type ValueSingleton <: ValueSingletonApi
   }
 
   // TODO: Boolean types
@@ -89,13 +75,8 @@ object Expressions {
   trait Floats extends Values {
     type Category >: this.type <: Floats
 
-    protected trait FloatExpressionApi extends ValueExpressionApi {
-      type JvmValue = Float
+    protected trait FloatTermApi extends ValueTermApi { this: FloatTerm =>
       type TermIn[C <: Category] = C#FloatTerm
-      type TypeIn[C <: Category] = C#FloatType
-    }
-
-    protected trait FloatTermApi extends ValueTermApi with FloatExpressionApi { this: FloatTerm =>
       def +(rightHandSide: FloatTerm): FloatTerm
       def -(rightHandSide: FloatTerm): FloatTerm
       def *(rightHandSide: FloatTerm): FloatTerm
@@ -107,12 +88,15 @@ object Expressions {
 
     type FloatTerm <: (ValueTerm with Any) with FloatTermApi
 
-    protected trait FloatTypeApi extends ValueTypeApi with FloatExpressionApi {}
+    protected trait FloatSingletonApi extends ValueSingletonApi {
+      type JvmValue = Float
+      type ThisTerm = FloatTerm
+    }
 
-    type FloatType <: (ValueType with Any) with FloatTypeApi
+    type FloatSingleton <: (ValueSingleton with Any) with FloatSingletonApi
 
     @inject
-    val float: Implicitly[FloatType]
+    val float: Implicitly[FloatSingleton]
 
   }
 
