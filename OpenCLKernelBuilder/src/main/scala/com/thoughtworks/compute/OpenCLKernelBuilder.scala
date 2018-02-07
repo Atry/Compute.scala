@@ -1,7 +1,7 @@
 package com.thoughtworks.compute
 
 import com.dongxiguo.fastring.Fastring.Implicits._
-import com.thoughtworks.compute.OpenCLKernelBuilder.ClTypeDefinition._
+import com.thoughtworks.compute.OpenCLKernelBuilder.TypeDefinition._
 import com.thoughtworks.compute.Expressions.FloatArrays
 import com.thoughtworks.compute.NDimensionalAffineTransform._
 import com.thoughtworks.feature.Factory.{Factory1, Factory2, Factory5, Factory6, inject}
@@ -9,23 +9,23 @@ import com.thoughtworks.feature.Factory.{Factory1, Factory2, Factory5, Factory6,
 import scala.collection.mutable
 object OpenCLKernelBuilder {
 
-  type ClTermCode = String
-  type ClTypeCode = String
+  type TermCode = String
+  type TypeCode = String
 
-  type ClTypeDefineHandler = ClTypeSymbol => Unit
+  type TypeDefineHandler = TypeSymbol => Unit
 
-  trait ClTypeDefinition extends Product {
-    def define(globalContext: GlobalContext): (ClTypeCode, ClTypeDefineHandler)
+  trait TypeDefinition extends Product {
+    def define(globalContext: GlobalContext): (TypeCode, TypeDefineHandler)
   }
 
-  object ClTypeDefinition {
-    private val Noop: ClTypeDefineHandler = Function.const(())
+  object TypeDefinition {
+    private val Noop: TypeDefineHandler = Function.const(())
 
-    final case class ArrayDefinition(element: ClTypeDefinition, shape: Array[Int]) extends ClTypeDefinition {
-      def define(globalContext: GlobalContext): (ClTypeCode, ClTypeDefineHandler) = {
+    final case class ArrayDefinition(element: TypeDefinition, shape: Array[Int]) extends TypeDefinition {
+      def define(globalContext: GlobalContext): (TypeCode, TypeDefineHandler) = {
         val elementTypeCode = globalContext.cachedSymbol(element).typeCode
         val arrayTypeCode = globalContext.freshName(raw"""${elementTypeCode}_array""")
-        val typeDefineHandler: ClTypeDefineHandler = { typeSymbol =>
+        val typeDefineHandler: TypeDefineHandler = { typeSymbol =>
           val dimensions = for (size <- shape) yield fast"[$size]"
           globalContext.globalDefinitions += fast"typedef global ${elementTypeCode} (* ${typeSymbol.typeCode})${dimensions.mkFastring};"
         }
@@ -33,14 +33,14 @@ object OpenCLKernelBuilder {
       }
     }
 
-    final case object FloatDefinition extends ClTypeDefinition {
-      def define(globalContext: GlobalContext): (ClTypeCode, ClTypeDefineHandler) = {
+    final case object FloatDefinition extends TypeDefinition {
+      def define(globalContext: GlobalContext): (TypeCode, TypeDefineHandler) = {
         "float" -> Noop
       }
     }
   }
 
-  final case class ClTypeSymbol(firstDefinition: ClTypeDefinition, typeCode: ClTypeCode)
+  final case class TypeSymbol(firstDefinition: TypeDefinition, typeCode: TypeCode)
 
   final class GlobalContext extends Fastring {
 
@@ -58,14 +58,14 @@ object OpenCLKernelBuilder {
 
     protected[OpenCLKernelBuilder] val globalDeclarations = mutable.Buffer.empty[Fastring]
     protected[OpenCLKernelBuilder] val globalDefinitions = mutable.Buffer.empty[Fastring]
-    private val typeSymbolCache = mutable.HashMap.empty[ClTypeDefinition, ClTypeSymbol]
+    private val typeSymbolCache = mutable.HashMap.empty[TypeDefinition, TypeSymbol]
 
     val floatSymbol = cachedSymbol(FloatDefinition)
 
-    def cachedSymbol(typeDefinition: ClTypeDefinition): ClTypeSymbol = {
+    def cachedSymbol(typeDefinition: TypeDefinition): TypeSymbol = {
       val (name, defined) = typeDefinition.define(this)
       val typeSymbol = typeSymbolCache.getOrElseUpdate(typeDefinition, {
-        ClTypeSymbol(typeDefinition, name)
+        TypeSymbol(typeDefinition, name)
       })
       if (typeSymbol.firstDefinition eq typeDefinition) {
         defined(typeSymbol)
@@ -125,29 +125,29 @@ trait OpenCLKernelBuilder extends FloatArrays {
   }
 
   protected trait TermApi extends super.TermApi { this: Term =>
-    def termCode: ClTermCode
-    def typeCode: ClTypeCode
+    def termCode: TermCode
+    def typeCode: TypeCode
   }
 
   type Term <: TermApi
 
   protected trait CodeValues extends TermApi { this: Term =>
-    val termCode: ClTermCode
-    val typeCode: ClTypeCode
+    val termCode: TermCode
+    val typeCode: TypeCode
   }
 
   protected trait ValueType {
 
     type ThisTerm <: ValueTerm
 
-    def typeSymbol: ClTypeSymbol
+    def typeSymbol: TypeSymbol
 
-    @inject def factory: Factory1[ClTermCode, ThisTerm]
+    @inject def factory: Factory1[TermCode, ThisTerm]
 
   }
 
   protected trait FloatSingletonApi extends super.FloatSingletonApi with ValueType {
-    def typeSymbol: ClTypeSymbol = floatSymbol
+    def typeSymbol: TypeSymbol = floatSymbol
     def literal(value: Float): ThisTerm = {
       val floatString = if (value.isNaN) {
         "NAN"
@@ -183,7 +183,7 @@ trait OpenCLKernelBuilder extends FloatArrays {
         .asInstanceOf[ThisTerm]
     }
 
-    val originalPaddingCode: ClTermCode
+    val originalPaddingCode: TermCode
 
     val originalShape: Array[Int]
 
@@ -236,17 +236,17 @@ trait OpenCLKernelBuilder extends FloatArrays {
   def arrayViewFactory[LocalElement <: ValueTerm]
     : Factory6[ValueType { type ThisTerm = LocalElement },
                MatrixData,
-               ClTermCode,
+               TermCode,
                Array[Int],
-               ClTermCode,
-               ClTypeCode,
+               TermCode,
+               TypeCode,
                ArrayTerm with ArrayView[LocalElement] { type Element = LocalElement }]
 
   protected trait ArrayParameter[LocalElement <: ValueTerm] extends super.ArrayTermApi with CodeValues {
     thisArrayParameter: ArrayTerm =>
 
     val elementType: ValueType { type ThisTerm = LocalElement }
-    val paddingCode: ClTermCode
+    val paddingCode: TermCode
     val shape: Array[Int]
 
     def transform(matrix: MatrixData): ThisTerm = {
@@ -275,10 +275,10 @@ trait OpenCLKernelBuilder extends FloatArrays {
   @inject
   def arrayParameterFactory[LocalElement <: ValueTerm]
     : Factory5[ValueType { type ThisTerm = LocalElement },
-               ClTermCode,
+               TermCode,
                Array[Int],
-               ClTermCode,
-               ClTypeCode,
+               TermCode,
+               TypeCode,
                ArrayTerm with ArrayParameter[LocalElement] { type Element = LocalElement }]
 
   protected trait ArrayCompanionApi extends super.ArrayCompanionApi {
@@ -303,8 +303,8 @@ trait OpenCLKernelBuilder extends FloatArrays {
 
   protected trait ArrayFill extends super.ArrayTermApi with TermApi { this: ArrayTerm =>
 
-    def termCode: ClTermCode = extract.termCode
-    def typeCode: ClTypeCode = extract.typeCode
+    def termCode: TermCode = extract.termCode
+    def typeCode: TypeCode = extract.typeCode
     def transform(matrix: MatrixData): ThisTerm = {
       this.asInstanceOf[ThisTerm]
     }
@@ -318,11 +318,11 @@ trait OpenCLKernelBuilder extends FloatArrays {
 
   protected trait ValueTermApi extends super.ValueTermApi with TermApi { thisValue: ValueTerm =>
 
-    val termCode: ClTermCode
+    val termCode: TermCode
 
     def valueType: ValueType { type ThisTerm = thisValue.ThisTerm }
 
-    def typeCode: ClTypeCode = valueType.typeSymbol.typeCode
+    def typeCode: TypeCode = valueType.typeSymbol.typeCode
 
     def fill: ArrayTerm { type Element = thisValue.ThisTerm } = {
       arrayFillFactory[thisValue.ThisTerm].newInstance(this.asInstanceOf[ThisTerm])
