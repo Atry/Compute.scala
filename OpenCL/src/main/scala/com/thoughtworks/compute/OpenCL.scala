@@ -754,7 +754,7 @@ object OpenCL {
       checkBuildErrorCode(None, clBuildProgram(handle, null, options, null, NULL))
     }
 
-    def build(): Unit = build("")
+    def build(): Unit = build("-O3 -funroll-loops")
 
     def monadicClose = UnitContinuation.delay {
       OpenCL.checkErrorCode(clReleaseProgram(handle))
