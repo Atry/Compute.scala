@@ -86,7 +86,7 @@ object OpenCL {
   private def decodeString(byteBuffer: ByteBuffer): String = memASCII(byteBuffer)
 
   @volatile
-  var defaultLogger: (String, ByteBuffer) => Unit = { (errorInfo: String, data: ByteBuffer) =>
+  var defaultLogger: (String, Option[ByteBuffer]) => Unit = { (errorInfo, data) =>
     // TODO: Add a test for in the case that Context is closed
     Console.err.println(raw"""An OpenCL notify comes out after its corresponding handler is freed
   message: $errorInfo
@@ -105,13 +105,17 @@ object OpenCL {
   private val contextCallback: CLContextCallback = CLContextCallback.create(new CLContextCallbackI {
     def invoke(errInfo: Long, privateInfo: Long, size: Long, userData: Long): Unit = {
       val errorInfo = decodeString(errInfo)
-      val data = memByteBuffer(privateInfo, size.toInt)
+      val dataOption = if (privateInfo != NULL) {
+        Some(memByteBuffer(privateInfo, size.toInt))
+      } else {
+        None
+      }
       memGlobalRefToObject[OpenCL](userData) match {
         case null =>
-          defaultLogger(decodeString(errInfo), memByteBuffer(privateInfo, size.toInt))
+          defaultLogger(decodeString(errInfo), dataOption)
         case opencl =>
           if (size.isValidInt) {
-            opencl.handleOpenCLNotification(decodeString(errInfo), memByteBuffer(privateInfo, size.toInt))
+            opencl.handleOpenCLNotification(decodeString(errInfo), dataOption)
           } else {
             throw new IllegalArgumentException(s"numberOfBytes($size) is too large")
           }
@@ -1015,8 +1019,13 @@ object OpenCL {
 
   trait LogContextNotification extends OpenCL {
 
-    protected def handleOpenCLNotification(errorInfo: String, privateInfo: ByteBuffer): Unit = {
-      Logger.takingImplicit[ByteBuffer](logger.underlying).info(errorInfo)(privateInfo)
+    protected def handleOpenCLNotification(errorInfo: String, privateInfoOption: Option[ByteBuffer]): Unit = {
+      privateInfoOption match {
+        case None =>
+          logger.info(errorInfo)
+        case Some(privateInfo) =>
+          Logger.takingImplicit[ByteBuffer](logger.underlying).info(errorInfo)(privateInfo)
+      }
     }
   }
 
@@ -1189,7 +1198,7 @@ trait OpenCL extends MonadicCloseable[UnitContinuation] with ImplicitsSingleton 
     releaseContext >> super.monadicClose
   }
 
-  protected def handleOpenCLNotification(errorInfo: String, privateInfo: ByteBuffer): Unit
+  protected def handleOpenCLNotification(errorInfo: String, privateInfo: Option[ByteBuffer]): Unit
 
   import OpenCL._
 
