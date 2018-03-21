@@ -8,6 +8,7 @@ import com.dongxiguo.fastring.Fastring
 import com.dongxiguo.fastring.Fastring.Implicits._
 import com.github.ghik.silencer.silent
 import com.google.common.cache._
+import com.thoughtworks.compute
 import com.thoughtworks.compute.Expressions.{Arrays, Floats, Tuples}
 import com.thoughtworks.compute.NDimensionalAffineTransform.MatrixData
 import com.thoughtworks.compute.OpenCLKernelBuilder.GlobalContext
@@ -327,46 +328,73 @@ trait Tensors extends OpenCL {
       program
     }
 
-    /**
-      * @see https://stackoverflow.com/questions/20753862/why-nvidia-and-amd-opencl-reduction-example-did-not-reduce-an-array-to-an-elemen/49253218#49253218
-      *      for preferred global size / local size settings.
-      */
     @transient
-    lazy val parallelReductionProgram = {
-      val program = createProgramWithSource(fastraw"""
-        kernel void reduce(global const float * restrict buffer,
-                           local float * restrict local_scratch,
-                           const int length,
-                           global float * restrict result) {
-          int global_index = get_global_id(0);
-          float accumulator = $zero;
-          // Loop sequentially over chunks of input vector
-          while (global_index < length) {
-            float element = buffer[global_index];
-            accumulator = ${append(fast"accumulator", fast"element")};
-            global_index += get_global_size(0);
-          }
-          // Perform parallel reduction in a work group
-          local_scratch[get_local_id(0)] = accumulator;
-          barrier(CLK_LOCAL_MEM_FENCE);
-          for (uint offset = get_local_size(0) / 2;
-               offset > 1;
-               offset = offset / 2) {
-            if (get_local_id(0) < offset) {
-              const float other = local_scratch[get_local_id(0) + offset];
-              const float mine = local_scratch[get_local_id(0)];
-              local_scratch[get_local_id(0)] = ${append(fast"mine", fast"other")};
+    lazy val parallelReductionProgramCache =
+      CacheBuilder
+        .newBuilder()
+        .asInstanceOf[CacheBuilder[Any, Any]]
+        .removalListener(
+          new RemovalListener[DeviceId, Program] {
+            def onRemoval(notification: RemovalNotification[DeviceId, Program]): Unit = {
+              val program = notification.getValue
+              program.monadicClose.blockingAwait
             }
-            barrier(CLK_LOCAL_MEM_FENCE);
           }
-          if (get_local_id(0) == 0) {
-            result[get_group_id(0)] = ${append(fast"local_scratch[0]", fast"local_scratch[1]")};
+        )
+        .build(
+          new CacheLoader[DeviceId, Program] {
+
+            /**
+              * @see https://stackoverflow.com/questions/20753862/why-nvidia-and-amd-opencl-reduction-example-did-not-reduce-an-array-to-an-elemen/49253218#49253218
+              *      for preferred global size / local size settings.
+              */
+            def load(deviceId: DeviceId): Program = {
+              val program = createProgramWithSource(fastraw"""
+                kernel void reduce(global const float * restrict buffer,
+                                   local float * restrict local_scratch,
+                                   const int length,
+                                   global float * restrict result) {
+                  int global_index = get_global_id(0);
+                  float accumulator = $zero;
+                  // Loop sequentially over chunks of input vector
+                  while (global_index < length) {
+                    float element = buffer[global_index];
+                    accumulator = ${append(fast"accumulator", fast"element")};
+                    global_index += get_global_size(0);
+                  }
+                  // Perform parallel reduction in a work group
+                  local_scratch[get_local_id(0)] = accumulator;
+                  barrier(CLK_LOCAL_MEM_FENCE);
+
+                  ${
+                def loop(offset: Long): Fastring = {
+                  if (offset > 1) {
+                    fastraw"""
+                      if (get_local_id(0) < $offset) {
+                        local_scratch[get_local_id(0)] = ${append(fast"local_scratch[get_local_id(0)]",
+                                                                  fast"local_scratch[get_local_id(0) + $offset]")};
+                      }
+                      barrier(CLK_LOCAL_MEM_FENCE);
+                      ${loop(offset / 2)}
+                    """
+                  } else {
+                    fast""
+                  }
+                }
+                loop(deviceId.maxWorkItemSizes.head / 2)
+              }
+                  if (get_local_id(0) == 0) {
+                    result[get_group_id(0)] = ${append(fast"local_scratch[0]", fast"local_scratch[1]")};
+                  }
+                }
+              """)
+              program.build(Seq(deviceId), openclCompilerFlags)
+              program
+
+            }
           }
-        }
-      """)
-      program.build(openclCompilerFlags)
-      program
-    }
+        )
+
   }
 
   object Tensor {
@@ -572,7 +600,8 @@ trait Tensors extends OpenCL {
             val length = thisTensor.shape.product
             allocateBuffer[Float](1).flatMap { outputBuffer =>
               dispatch { commandQueue =>
-                commandQueue.deviceId.deviceType match {
+                val deviceId = commandQueue.deviceId
+                deviceId.deviceType match {
                   case CL_DEVICE_TYPE_CPU =>
                     Do.monadicCloseable(programs.sequentialReductionProgram.createFirstKernel()).intransitiveFlatMap {
                       kernel1: Kernel =>
@@ -588,10 +617,10 @@ trait Tensors extends OpenCL {
                           )
                     }
                   case _ =>
-                    Do.monadicCloseable(programs.parallelReductionProgram.createFirstKernel()).intransitiveFlatMap {
-                      kernel1: Kernel =>
-                        val stage1LocalWorkSize: Long = math.min(length, kernel1.workGroupSize(commandQueue.deviceId))
-                        val maxNumberOfReductionGroups = commandQueue.deviceId.maxComputeUnits
+                    Do.monadicCloseable(programs.parallelReductionProgramCache.get(deviceId).createFirstKernel())
+                      .intransitiveFlatMap { kernel1: Kernel =>
+                        val stage1LocalWorkSize: Long = math.min(length, kernel1.workGroupSize(deviceId))
+                        val maxNumberOfReductionGroups = deviceId.maxComputeUnits
                         val numberOfStage1Groups = if (length % stage1LocalWorkSize == 0) {
                           math.min(length / stage1LocalWorkSize, maxNumberOfReductionGroups)
                         } else {
@@ -623,12 +652,13 @@ trait Tensors extends OpenCL {
                                 waitingEvents = inputPendingBuffer.eventOption.map(_.handle).toSeq
                               )
                               .intransitiveFlatMap { scratchEvent: Event =>
-                                Do.monadicCloseable(programs.parallelReductionProgram.createFirstKernel())
+                                Do.monadicCloseable(
+                                    programs.parallelReductionProgramCache.get(deviceId).createFirstKernel())
                                   .intransitiveFlatMap { kernel2: Kernel =>
                                     // FIXME: An exception thrown here will not be handled. Need further investigation.
 
                                     val stage2WorkSize: Long =
-                                      math.min(numberOfStage1Groups, kernel2.workGroupSize(commandQueue.deviceId))
+                                      math.min(numberOfStage1Groups, kernel2.workGroupSize(deviceId))
                                     kernel2(0) = globalScratchBuffer
                                     kernel2.setLocalMemorySize[Float](1, stage2WorkSize)
                                     kernel2(2) = numberOfStage1Groups.toInt
@@ -644,7 +674,7 @@ trait Tensors extends OpenCL {
                               }
                           }
                         }
-                    }
+                      }
                 }
 
               }.map { stage2Event: Event =>

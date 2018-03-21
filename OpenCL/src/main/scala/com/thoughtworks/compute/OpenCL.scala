@@ -147,12 +147,13 @@ object OpenCL {
 
     final class ImageFormatNotSupported(message: String = null) extends IllegalStateException(message)
 
-    final class BuildProgramFailure(buildLogs: Map[Long /* device id */, String] = Map.empty)
+    final class BuildProgramFailure[Owner <: Singleton with OpenCL](
+        buildLogs: Map[DeviceId[Owner], String] = Map.empty[DeviceId[Owner], String])
         extends IllegalStateException({
           buildLogs.view
             .map {
               case (deviceId, buildLog) =>
-                f"CL_BUILD_PROGRAM_FAILURE on device 0x$deviceId%X:\n$buildLog"
+                f"CL_BUILD_PROGRAM_FAILURE on device 0x${deviceId.handle}%X:\n$buildLog"
             }
             .mkString("\n")
         })
@@ -784,7 +785,7 @@ object OpenCL {
       result(0)
     }
 
-    def deviceIds: Seq[Long] = {
+    def deviceIds: Seq[DeviceId[Owner]] = {
       val stack = stackPush()
       try {
         val sizeBuffer = stack.mallocPointer(1)
@@ -792,7 +793,9 @@ object OpenCL {
         val numberOfDeviceIds = sizeBuffer.get(0).toInt / POINTER_SIZE
         val programDevicesBuffer = stack.mallocPointer(numberOfDeviceIds)
         checkErrorCode(clGetProgramInfo(this.handle, CL_PROGRAM_DEVICES, programDevicesBuffer, sizeBuffer))
-        (0 until numberOfDeviceIds).map(programDevicesBuffer.get)
+        (0 until numberOfDeviceIds).map { i =>
+          DeviceId[Owner](programDevicesBuffer.get(i))
+        }
       } finally {
         stack.close()
       }
@@ -821,16 +824,16 @@ object OpenCL {
       }
     }
 
-    private def buildLogs(deviceIds: Seq[Long]): Map[Long /* device ID */, String] = {
+    private def buildLogs(deviceIds: Seq[DeviceId[Owner]]): Map[DeviceId[Owner], String] = {
       val stack = stackPush()
       try {
         val sizeBuffer = stack.mallocPointer(1)
         deviceIds.view.map { deviceId =>
           checkErrorCode(
-            clGetProgramBuildInfo(this.handle, deviceId, CL_PROGRAM_BUILD_LOG, null: PointerBuffer, sizeBuffer))
+            clGetProgramBuildInfo(this.handle, deviceId.handle, CL_PROGRAM_BUILD_LOG, null: PointerBuffer, sizeBuffer))
           val logBuffer = MemoryUtil.memAlloc(sizeBuffer.get(0).toInt) //stack.malloc()
           try {
-            checkErrorCode(clGetProgramBuildInfo(this.handle, deviceId, CL_PROGRAM_BUILD_LOG, logBuffer, null))
+            checkErrorCode(clGetProgramBuildInfo(this.handle, deviceId.handle, CL_PROGRAM_BUILD_LOG, logBuffer, null))
             (deviceId, decodeString(logBuffer))
           } finally {
             MemoryUtil.memFree(logBuffer)
@@ -841,7 +844,7 @@ object OpenCL {
       }
     }
 
-    private def checkBuildErrorCode(deviceIdsOption: Option[Seq[Long]], errorCode: Int): Unit = {
+    private def checkBuildErrorCode(deviceIdsOption: Option[Seq[DeviceId[Owner]]], errorCode: Int): Unit = {
       errorCode match {
         case CL_BUILD_PROGRAM_FAILURE =>
           val logs = deviceIdsOption match {
@@ -853,10 +856,12 @@ object OpenCL {
       }
     }
 
-    def build(deviceIds: Seq[Long], options: CharSequence = ""): Unit = {
+    def build(deviceIds: Seq[DeviceId[Owner]], options: CharSequence = ""): Unit = {
       val stack = stackPush()
       try {
-        checkBuildErrorCode(Some(deviceIds), clBuildProgram(handle, stack.pointers(deviceIds: _*), options, null, NULL))
+        checkBuildErrorCode(
+          Some(deviceIds),
+          clBuildProgram(handle, stack.pointers(deviceIds.view.map(_.handle): _*), options, null, NULL))
       } finally {
         stack.close()
       }
