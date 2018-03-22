@@ -284,18 +284,18 @@ trait Tensors extends OpenCL {
     def zero: Fastring = fast"0.0f"
 
     def jvmReduce(array: Array[Float]): Float = {
-      val tmp = new Array[Float](4)
-      val rest = array.length % 4
-      val vectorLength = array.length - rest
+
+      val tmp = new Array[Float](8)
+      val vectorLength = array.length - (array.length % tmp.length)
 
       var i = 0
       while (i < vectorLength) {
-        tmp(0) += array(i)
-        tmp(1) += array(i + 1)
-        tmp(2) += array(i + 2)
-        tmp(3) += array(i + 3)
-
-        i += 4
+        var j = 0
+        while (j < tmp.length) {
+          tmp(j) += array(i + j)
+          j += 1
+        }
+        i += tmp.length
       }
 
       var result = tmp.sum
