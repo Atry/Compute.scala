@@ -384,12 +384,29 @@ object OpenCL {
     @transient private lazy val commandQueues: Seq[CommandQueue] = {
       deviceIds.flatMap { deviceId =>
         val capabilities = deviceCapabilities(deviceId)
-        for (i <- 0 until numberOfCommandQueuesPerDevice) yield {
-          val supportedProperties = deviceId.longInfo(CL_DEVICE_QUEUE_PROPERTIES)
-          val properties = Map(
-            CL_QUEUE_PROPERTIES -> (supportedProperties & CL_QUEUE_ON_DEVICE)
-          )
-          createCommandQueue(deviceId, properties)
+        val supportedProperties = deviceId.longInfo(CL_DEVICE_QUEUE_PROPERTIES)
+        if ((supportedProperties & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) == CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) {
+          if (numberOfCommandQueuesPerDevice > 0) {
+            val properties = Map(
+              CL_QUEUE_PROPERTIES -> ((supportedProperties & CL_QUEUE_ON_DEVICE) | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE)
+            )
+            val queue = createCommandQueue(deviceId, properties)
+            for (i <- 1 until numberOfCommandQueuesPerDevice) {
+              queue.duplicate()
+            }
+            Seq.fill(numberOfCommandQueuesPerDevice)(queue)
+          } else {
+            Nil
+          }
+
+        } else {
+
+          for (i <- 0 until numberOfCommandQueuesPerDevice) yield {
+            val properties = Map(
+              CL_QUEUE_PROPERTIES -> (supportedProperties & CL_QUEUE_ON_DEVICE)
+            )
+            createCommandQueue(deviceId, properties)
+          }
         }
       }
     }
@@ -497,6 +514,11 @@ object OpenCL {
 
     def flush(): Unit = {
       checkErrorCode(clFlush(handle))
+    }
+
+    def duplicate(): CommandQueue[Owner] = {
+      checkErrorCode(clRetainCommandQueue(handle))
+      CommandQueue(handle)
     }
 
     def monadicClose: UnitContinuation[Unit] = UnitContinuation.delay {
