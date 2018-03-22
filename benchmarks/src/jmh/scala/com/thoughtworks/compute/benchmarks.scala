@@ -179,8 +179,7 @@ object benchmarks {
 
         input.doBuffer.map { _ =>
           { () =>
-            val Array(v) = input.sum.flatArray.run.blockingAwait
-            v
+            input.sum.blockingAwait
           }
         }
       }

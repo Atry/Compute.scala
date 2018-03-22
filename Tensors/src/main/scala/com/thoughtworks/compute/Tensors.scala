@@ -1,6 +1,7 @@
 package com.thoughtworks.compute
 
 import java.nio.ByteBuffer
+import java.util
 import java.util.concurrent.Callable
 import java.util.{Collections, IdentityHashMap}
 
@@ -9,6 +10,7 @@ import com.dongxiguo.fastring.Fastring.Implicits._
 import com.github.ghik.silencer.silent
 import com.google.common.cache._
 import com.thoughtworks.compute.Expressions.{Arrays, Floats, Tuples}
+import com.thoughtworks.compute.Memory.FloatMemory
 import com.thoughtworks.compute.NDimensionalAffineTransform.MatrixData
 import com.thoughtworks.compute.OpenCLKernelBuilder.GlobalContext
 import com.thoughtworks.compute.Tensors.{MemoryTrees, TensorBuilder}
@@ -280,11 +282,37 @@ trait Tensors extends OpenCL {
   protected object PlusPrograms extends MonoidPrograms {
     def append(leftHandSide: Fastring, rightHandSide: Fastring): Fastring = fast"(($leftHandSide) + ($rightHandSide))"
     def zero: Fastring = fast"0.0f"
+
+    def jvmReduce(array: Array[Float]): Float = {
+      val tmp = new Array[Float](4)
+      val rest = array.length % 4
+      val vectorLength = array.length - rest
+
+      var i = 0
+      while (i < vectorLength) {
+        tmp(0) += array(i)
+        tmp(1) += array(i + 1)
+        tmp(2) += array(i + 2)
+        tmp(3) += array(i + 3)
+
+        i += 4
+      }
+
+      var result = tmp.sum
+      while (i < array.length) {
+        result += array(i)
+        i += 1
+      }
+
+      result
+    }
   }
 
   protected trait MonoidPrograms {
     def append(leftHandSide: Fastring, rightHandSide: Fastring): Fastring
     def zero: Fastring
+
+    def jvmReduce(array: Array[Float]): Float
 
     @transient
     lazy val sequentialReductionProgram = {
@@ -563,99 +591,92 @@ trait Tensors extends OpenCL {
 
     def toBufferedTensor: BufferedTensor
 
-    private def reduce(programs: MonoidPrograms): Tensor = {
-      new {
-        val padding: Float = thisTensor.padding
+    private def reduce(programs: MonoidPrograms): Future[Float] = {
 
-        val doBuffer: Do[PendingBuffer[Float]] = {
-          thisTensor.doBuffer.intransitiveFlatMap { inputPendingBuffer: PendingBuffer[Float] =>
-            val length = thisTensor.shape.product
-            allocateBuffer[Float](1).flatMap { outputBuffer =>
-              dispatch { commandQueue =>
-                commandQueue.deviceId.deviceType match {
-                  case CL_DEVICE_TYPE_CPU =>
-                    Do.monadicCloseable(programs.sequentialReductionProgram.createFirstKernel()).intransitiveFlatMap {
-                      kernel1: Kernel =>
-                        kernel1(0) = inputPendingBuffer.buffer
-                        kernel1(1) = length
-                        kernel1(2) = outputBuffer
-                        kernel1
-                          .enqueue(
-                            commandQueue,
-                            globalWorkSize = Array(1L),
-                            localWorkSize = Some(Array(1L): Seq[Long]),
-                            waitingEvents = inputPendingBuffer.eventOption.map(_.handle).toSeq
-                          )
-                    }
-                  case _ =>
-                    Do.monadicCloseable(programs.parallelReductionProgram.createFirstKernel()).intransitiveFlatMap {
-                      kernel1: Kernel =>
-                        val stage1LocalWorkSize: Long = math.min(length, kernel1.workGroupSize(commandQueue.deviceId))
-                        val maxNumberOfReductionGroups = commandQueue.deviceId.maxComputeUnits
-                        val numberOfStage1Groups = if (length % stage1LocalWorkSize == 0) {
-                          math.min(length / stage1LocalWorkSize, maxNumberOfReductionGroups)
-                        } else {
-                          math.min(length / stage1LocalWorkSize + 1, maxNumberOfReductionGroups)
-                        }
-                        if (numberOfStage1Groups == 1) {
-                          kernel1(0) = inputPendingBuffer.buffer
-                          kernel1.setLocalMemorySize[Float](1, stage1LocalWorkSize)
-                          kernel1(2) = length
-                          kernel1(3) = outputBuffer
-                          kernel1.enqueue(
-                            commandQueue,
-                            globalWorkSize = Array(stage1LocalWorkSize),
-                            localWorkSize = Some(Array(stage1LocalWorkSize): Seq[Long]),
-                            waitingEvents = inputPendingBuffer.eventOption.map(_.handle).toSeq
-                          )
-                        } else {
+      thisTensor.doBuffer.intransitiveFlatMap { inputPendingBuffer: PendingBuffer[Float] =>
+        val length = thisTensor.shape.product
+//        allocateBuffer[Float](1).flatMap { outputBuffer =>
+        acquireCommandQueue.flatMap { commandQueue =>
+          commandQueue.deviceId.deviceType match {
+            case CL_DEVICE_TYPE_CPU =>
+              allocateBuffer[Float](1).flatMap { outputBuffer =>
+                Do.monadicCloseable(programs.sequentialReductionProgram.createFirstKernel()).intransitiveFlatMap {
+                  kernel1: Kernel =>
+                    kernel1(0) = inputPendingBuffer.buffer
+                    kernel1(1) = length
+                    kernel1(2) = outputBuffer
+                    kernel1
+                      .enqueue(
+                        commandQueue,
+                        globalWorkSize = Array(1L),
+                        localWorkSize = Some(Array(1L): Seq[Long]),
+                        waitingEvents = inputPendingBuffer.eventOption.map(_.handle).toSeq
+                      )
+                      .flatMap { event1 =>
+                        Do(TryT(ResourceT(UnitContinuation.delay {
+                          val hostBuffer = FloatMemory.allocate(1)
+                          Resource(value = Success(hostBuffer),
+                                   release = UnitContinuation.delay { FloatMemory.free(hostBuffer) })
+                        }))).flatMap { hostBuffer =>
+                          enqueueReadBuffer(commandQueue, outputBuffer, hostBuffer, event1).flatMap { event2 =>
+                            Do.garbageCollected(event2.waitForComplete()).map { _: Unit =>
+                              hostBuffer.get(0)
+                            }
 
-                          allocateBuffer[Float](numberOfStage1Groups).intransitiveFlatMap { globalScratchBuffer =>
-                            kernel1(0) = inputPendingBuffer.buffer
-                            kernel1.setLocalMemorySize[Float](1, stage1LocalWorkSize)
-                            kernel1(2) = length
-                            kernel1(3) = globalScratchBuffer
-                            kernel1
-                              .enqueue(
-                                commandQueue,
-                                globalWorkSize = Array(stage1LocalWorkSize * numberOfStage1Groups),
-                                localWorkSize = Some(Array(stage1LocalWorkSize): Seq[Long]),
-                                waitingEvents = inputPendingBuffer.eventOption.map(_.handle).toSeq
-                              )
-                              .intransitiveFlatMap { scratchEvent: Event =>
-                                Do.monadicCloseable(programs.parallelReductionProgram.createFirstKernel())
-                                  .intransitiveFlatMap { kernel2: Kernel =>
-                                    // FIXME: An exception thrown here will not be handled. Need further investigation.
-
-                                    val stage2WorkSize: Long =
-                                      math.min(numberOfStage1Groups, kernel2.workGroupSize(commandQueue.deviceId))
-                                    kernel2(0) = globalScratchBuffer
-                                    kernel2.setLocalMemorySize[Float](1, stage2WorkSize)
-                                    kernel2(2) = numberOfStage1Groups.toInt
-                                    kernel2(3) = outputBuffer
-
-                                    kernel2.enqueue(
-                                      commandQueue,
-                                      globalWorkSize = Array(stage2WorkSize),
-                                      localWorkSize = Some(Array(stage2WorkSize): Seq[Long]),
-                                      waitingEvents = Array(scratchEvent.handle)
-                                    )
-                                  }
-                              }
                           }
                         }
-                    }
-                }
 
-              }.map { stage2Event: Event =>
-                EventBuffer[Float](outputBuffer, stage2Event)
+                      }
+                }
               }
-            }
-          }.shared
+            case _ =>
+              Do.monadicCloseable(programs.parallelReductionProgram.createFirstKernel()).intransitiveFlatMap {
+                kernel1: Kernel =>
+                  val stage1LocalWorkSize: Long = math.min(length, kernel1.workGroupSize(commandQueue.deviceId))
+                  val maxNumberOfReductionGroups = commandQueue.deviceId.maxComputeUnits
+                  val numberOfStage1Groups = if (length % stage1LocalWorkSize == 0) {
+                    math.min(length / stage1LocalWorkSize, maxNumberOfReductionGroups)
+                  } else {
+                    math.min(length / stage1LocalWorkSize + 1, maxNumberOfReductionGroups)
+                  }
+                  if (numberOfStage1Groups > Int.MaxValue) {
+                    throw new IllegalStateException("shape is too large")
+                  }
+
+                  allocateBuffer[Float](numberOfStage1Groups).intransitiveFlatMap { globalScratchBuffer =>
+                    kernel1(0) = inputPendingBuffer.buffer
+                    kernel1.setLocalMemorySize[Float](1, stage1LocalWorkSize)
+                    kernel1(2) = length
+                    kernel1(3) = globalScratchBuffer
+
+                    kernel1
+                      .enqueue(
+                        commandQueue,
+                        globalWorkSize = Array(stage1LocalWorkSize * numberOfStage1Groups),
+                        localWorkSize = Some(Array(stage1LocalWorkSize): Seq[Long]),
+                        waitingEvents = inputPendingBuffer.eventOption.map(_.handle).toSeq
+                      )
+                      .flatMap { event1 =>
+                        Do(TryT(ResourceT(UnitContinuation.delay {
+                          val hostBuffer = FloatMemory.allocate(numberOfStage1Groups.toInt)
+                          Resource(value = Success(hostBuffer),
+                                   release = UnitContinuation.delay { FloatMemory.free(hostBuffer) })
+                        }))).flatMap { hostBuffer =>
+                          enqueueReadBuffer(commandQueue, globalScratchBuffer, hostBuffer, event1).flatMap { event2 =>
+                            Do.garbageCollected(event2.waitForComplete()).map { _: Unit =>
+                              val array = Array.ofDim[Float](numberOfStage1Groups.toInt)
+                              hostBuffer.get(array)
+                              programs.jvmReduce(array)
+                            }
+                          }
+                        }
+                      }
+
+                  }
+              }
+          }
         }
-      } with BufferedTensor {
-        def shape: Array[Int] = Tensors.ScalarShape
-      }
+      }.run
     }
 
     def sum = reduce(PlusPrograms)
