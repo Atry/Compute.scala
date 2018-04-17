@@ -11,8 +11,8 @@ import com.github.ghik.silencer.silent
 import com.google.common.cache._
 import com.thoughtworks.compute.Expressions.{Arrays, Floats, Tuples}
 import com.thoughtworks.compute.NDimensionalAffineTransform.MatrixData
+import com.thoughtworks.compute.OpenCL.{DeviceBuffer, Event}
 import com.thoughtworks.compute.OpenCLKernelBuilder.GlobalContext
-import com.thoughtworks.compute.Tensors.{MemoryTrees, TensorBuilder}
 import com.thoughtworks.compute.Trees.{AllTrees, StructuralTrees}
 import com.thoughtworks.continuation._
 import com.thoughtworks.feature.Factory
@@ -31,7 +31,7 @@ import scala.collection.{SeqView, mutable}
 import scala.concurrent.{ExecutionContext, SyncVar}
 import scala.language.existentials
 import scala.reflect.ClassTag
-import scala.util.{Random, Success}
+import scala.util.{Failure, Random, Success, Try}
 import scalaz.Tags.Parallel
 import scalaz.Trampoline
 import scalaz.std.list._
@@ -213,9 +213,65 @@ object Tensors {
     type TupleType <: (ValueType with Any) with MemoryTupleType
 
   }
+
+  protected sealed trait PendingBuffer[Owner <: OpenCL with Singleton, JvmValue] {
+    def buffer: DeviceBuffer[Owner, JvmValue]
+    def eventOption: Option[Event[Owner]]
+    def toHostBuffer()(implicit memory: Memory[JvmValue]): Do[memory.HostBuffer]
+
+    def toArray()(implicit memory: Memory[JvmValue]): Do[Array[JvmValue]] = {
+      toHostBuffer()(memory).intransitiveMap { hostBuffer: memory.HostBuffer =>
+        memory.toArray(hostBuffer)
+      }
+    }
+
+    def retain(): Unit = {
+      buffer.retain()
+      eventOption.foreach(_.retain())
+    }
+
+    def release(): Unit = {
+      buffer.release()
+      eventOption.foreach(_.release())
+    }
+  }
+
+  private[Tensors] sealed trait CacheState[Owner <: OpenCL with Singleton, JvmValue]
+  private[Tensors] object CacheState {
+    sealed trait Fetching[Owner <: OpenCL with Singleton, JvmValue] extends CacheState[Owner, JvmValue] {
+      def handleFailure(e: Throwable): Trampoline[Unit]
+
+      def handleSuccess(pendingBuffer: PendingBuffer[Owner, JvmValue]): Trampoline[Unit]
+    }
+
+    final case class EarlyClosed[Owner <: OpenCL with Singleton, JvmValue](fetching: Fetching[Owner, JvmValue])
+        extends CacheState[Owner, JvmValue]
+
+    final case class Closed[Owner <: OpenCL with Singleton, JvmValue]() extends CacheState[Owner, JvmValue]
+    val closedCache = new Closed[OpenCL with Singleton, Any]
+    def closed[Owner <: OpenCL with Singleton, JvmValue] = closedCache.asInstanceOf[Closed[Owner, JvmValue]]
+
+    final case class NoHandler[Owner <: OpenCL with Singleton, JvmValue]() extends Fetching[Owner, JvmValue] {
+      def handleSuccess(pendingBuffer: PendingBuffer[Owner, JvmValue]): Trampoline[Unit] = Trampoline.done(())
+      def handleFailure(e: Throwable): Trampoline[Unit] = Trampoline.done(())
+    }
+
+    final case class Open[Owner <: OpenCL with Singleton, JvmValue](pendingBuffer: PendingBuffer[Owner, JvmValue])
+        extends CacheState[Owner, JvmValue]
+
+    val noHandlerCache = new NoHandler[OpenCL with Singleton, Any]()
+    def noHandler[Owner <: OpenCL with Singleton, JvmValue] =
+      noHandlerCache.asInstanceOf[NoHandler[Owner, JvmValue]]
+
+    final case class Failed[Owner <: OpenCL with Singleton, JvmValue](e: Throwable) extends CacheState[Owner, JvmValue]
+
+  }
 }
 
 trait Tensors extends OpenCL {
+  import com.thoughtworks.compute.Tensors._
+
+  type PendingBuffer[JvmValue] = Tensors.PendingBuffer[this.type, JvmValue]
 
   protected val trees
     : AllTrees with MemoryTrees with StructuralTrees { type Category = Tuples with Floats with Arrays } =
@@ -246,31 +302,19 @@ trait Tensors extends OpenCL {
     builder.result()
   }
 
-  protected sealed trait PendingBuffer[JvmType] {
-    def buffer: DeviceBuffer[JvmType]
-    def eventOption: Option[Event]
-    def toHostBuffer()(implicit memory: Memory[JvmType]): Do[memory.HostBuffer]
-
-    def toArray()(implicit memory: Memory[JvmType]): Do[Array[JvmType]] = {
-      toHostBuffer()(memory).intransitiveMap { hostBuffer: memory.HostBuffer =>
-        memory.toArray(hostBuffer)
-      }
-    }
-  }
-
   @(silent @companionObject)
-  protected final case class ReadyBuffer[JvmType](buffer: DeviceBuffer[JvmType]) extends PendingBuffer[JvmType] {
-    def toHostBuffer()(implicit memory: Memory[JvmType]): Do[memory.HostBuffer] = {
+  protected final case class ReadyBuffer[JvmValue](buffer: DeviceBuffer[JvmValue]) extends PendingBuffer[JvmValue] {
+    def toHostBuffer()(implicit memory: Memory[JvmValue]): Do[memory.HostBuffer] = {
       buffer.toHostBuffer()(Witness(Tensors.this), memory)
     }
     def eventOption = None
   }
 
   @(silent @companionObject)
-  protected final case class EventBuffer[JvmType](buffer: DeviceBuffer[JvmType], event: Event)
-      extends PendingBuffer[JvmType] {
+  protected final case class EventBuffer[JvmValue](buffer: DeviceBuffer[JvmValue], event: Event)
+      extends PendingBuffer[JvmValue] {
     def eventOption = Some(event)
-    def toHostBuffer()(implicit memory: Memory[JvmType]): Do[memory.HostBuffer] = {
+    def toHostBuffer()(implicit memory: Memory[JvmValue]): Do[memory.HostBuffer] = {
       buffer.toHostBuffer(event)
     }
   }
@@ -566,6 +610,8 @@ trait Tensors extends OpenCL {
 
   }
 
+  trait CachedTensor extends AutoCloseable with NonInlineTensor
+
   /**
     * @groupname metadata General information
     * @groupprio metadata 1
@@ -587,6 +633,187 @@ trait Tensors extends OpenCL {
     *
     */
   sealed trait Tensor { thisTensor =>
+
+    /** Allocates device-side cache that are managed by the [[https://github.com/ThoughtWorksInc/RAII.scala RAII.scala]] library.
+      *
+      * @note This method is similar to [[cache]],
+      *       except the life cycle of the cache can be automatically managed.
+      *
+      * @group slow
+      */
+    def doCache: Do[CachedTensor] = {
+      Do.autoCloseable(cache())
+    }
+
+    /** Allocates device-side cache for this [[Tensor]], and returns a [[java.lang.AutoCloseable]] to release the cache.
+      *
+      * @note This method can be called multiple times on one [[Tensor]].
+      *       Only one copy of cache will be allocated,
+      *       which will be finally released until all [[java.lang.AutoCloseable]] returned by [[cache]] method are closed.
+      *
+      * @group slow
+      */
+    def cache(): CachedTensor = {
+
+      final class StateTensor
+          extends AtomicReference[CacheState[Tensors.this.type, closure.JvmValue]](CacheState.noHandler)
+          with CachedTensor {
+
+        val shape: Array[Int] = thisTensor.shape
+        val padding: Float = thisTensor.padding
+
+        @tailrec
+        def failed(e: Throwable): Trampoline[Unit] = {
+          get() match {
+            case oldState: CacheState.Fetching[Tensors.this.type, closure.JvmValue] =>
+              val newState = CacheState.Failed[Tensors.this.type, closure.JvmValue](e)
+              if (compareAndSet(oldState, newState)) {
+                oldState.handleFailure(e)
+                Trampoline.done(())
+              } else {
+                failed(e)
+              }
+            case _: CacheState.Failed[Tensors.this.type, closure.JvmValue] |
+                _: CacheState.Open[Tensors.this.type, closure.JvmValue] |
+                _: CacheState.Closed[Tensors.this.type, closure.JvmValue] =>
+              throw new IllegalStateException()
+            case oldState @ CacheState.EarlyClosed(fetching) =>
+              if (compareAndSet(oldState, CacheState.closed)) {
+                fetching.handleFailure(e)
+                Trampoline.done(())
+              } else {
+                failed(e)
+              }
+          }
+        }
+
+        @tailrec
+        def open(pendingBuffer: PendingBuffer[closure.JvmValue]): Trampoline[Unit] = {
+          get() match {
+            case oldState: CacheState.Fetching[Tensors.this.type, closure.JvmValue] =>
+              val newState = CacheState.Open(pendingBuffer)
+              if (compareAndSet(oldState, newState)) {
+                pendingBuffer.retain()
+                oldState.handleSuccess(pendingBuffer)
+                Trampoline.done(())
+              } else {
+                open(pendingBuffer)
+              }
+            case _: CacheState.Failed[Tensors.this.type, closure.JvmValue] |
+                _: CacheState.Open[Tensors.this.type, closure.JvmValue] |
+                _: CacheState.Closed[Tensors.this.type, closure.JvmValue] =>
+              throw new IllegalStateException()
+            case oldState @ CacheState.EarlyClosed(fetching) =>
+              if (compareAndSet(oldState, CacheState.closed)) {
+                fetching.handleSuccess(pendingBuffer)
+                Trampoline.done(())
+              } else {
+                open(pendingBuffer)
+              }
+
+          }
+        }
+
+        @tailrec private def asyncGetBuffer(
+            bufferHandler: Resource[UnitContinuation, Try[PendingBuffer[closure.JvmValue]]] => Trampoline[Unit])
+          : Trampoline[Unit] = {
+
+          @inline
+          def continueSuccess(pendingBuffer: PendingBuffer[closure.JvmValue]) = {
+            pendingBuffer.retain()
+            val release = UnitContinuation.safeAsync[Unit] { continue =>
+              pendingBuffer.release()
+              continue(())
+            }
+            val resource = Resource(Success(pendingBuffer), release)
+            bufferHandler(resource)
+          }
+          @inline
+          def continueFailure(e: Throwable) = {
+            val resource = Resource(Failure(e), UnitContinuation.now(()))
+            bufferHandler(resource)
+          }
+
+          get() match {
+            case oldState: CacheState.Fetching[Tensors.this.type, closure.JvmValue] =>
+              val newState = new CacheState.Fetching[Tensors.this.type, closure.JvmValue] {
+                def handleSuccess(pendingBuffer: PendingBuffer[closure.JvmValue]): Trampoline[Unit] = {
+                  oldState.handleSuccess(pendingBuffer).flatMap { _: Unit =>
+                    continueSuccess(pendingBuffer)
+                  }
+                }
+
+                def handleFailure(e: Throwable): Trampoline[Unit] = {
+                  oldState.handleFailure(e).flatMap { _: Unit =>
+                    continueFailure(e)
+                  }
+                }
+              }
+              if (compareAndSet(oldState, newState)) {
+                Trampoline.done(())
+              } else {
+                asyncGetBuffer(bufferHandler)
+              }
+            case oldState @ CacheState.Open(pendingBuffer) =>
+              continueSuccess(pendingBuffer)
+            case oldState @ CacheState.Failed(e) =>
+              continueFailure(e)
+            case _: CacheState.Closed[Tensors.this.type, closure.JvmValue] |
+                _: CacheState.EarlyClosed[Tensors.this.type, closure.JvmValue] =>
+              throw new IllegalStateException()
+          }
+        }
+
+        private[compute] def doBuffer: Do[PendingBuffer[closure.JvmValue]] = {
+          Do.safeAsync[PendingBuffer[closure.JvmValue]](asyncGetBuffer)
+        }
+
+        def close(): Unit = {
+          get() match {
+            case oldState: CacheState.Fetching[Tensors.this.type, closure.JvmValue] =>
+              if (compareAndSet(oldState, CacheState.EarlyClosed(oldState))) {
+                Trampoline.done(())
+              } else {
+                close()
+              }
+            case oldState @ CacheState.Open(pendingBuffer) =>
+              if (compareAndSet(oldState, CacheState.closed)) {
+                pendingBuffer.release()
+                Trampoline.done(())
+              } else {
+                close()
+              }
+            case oldState: CacheState.Failed[Tensors.this.type, closure.JvmValue] =>
+              if (compareAndSet(oldState, CacheState.closed)) {
+                Trampoline.done(())
+              } else {
+                close()
+              }
+            case _: CacheState.Closed[Tensors.this.type, closure.JvmValue] |
+                _: CacheState.EarlyClosed[Tensors.this.type, closure.JvmValue] =>
+              throw new IllegalStateException()
+          }
+        }
+
+      }
+
+      val stateTensor = new StateTensor
+      val () = thisTensor.doBuffer
+        .intransitiveMap { pendingBuffer =>
+          pendingBuffer.buffer.retain()
+          pendingBuffer.eventOption.foreach(_.retain())
+          pendingBuffer
+        }
+        .run
+        .safeOnComplete {
+          case Failure(e) =>
+            stateTensor.failed(e)
+          case Success(pendingBuffer) =>
+            stateTensor.open(pendingBuffer)
+        }
+        .run
+      stateTensor
+    }
 
     /**
       * @group delayed
@@ -1194,82 +1421,6 @@ trait Tensors extends OpenCL {
     @transient
     protected lazy val closure = {
       arrayTerm.extract
-    }
-
-    /** Allocates device-side cache that are managed by the [[https://github.com/ThoughtWorksInc/RAII.scala RAII.scala]] library.
-      *
-      * @note This method is similar to [[cache]],
-      *       except the life cycle of the cache can be automatically managed.
-      *
-      * @group slow
-      */
-    def doCache: Do[this.type] = doBuffer.map(Function.const(this))
-
-    /** Allocates device-side cache for this [[Tensor]], and returns a [[java.lang.AutoCloseable]] to release the cache.
-      *
-      * @note This method can be called multiple times on one [[Tensor]].
-      *       Only one copy of cache will be allocated,
-      *       which will be finally released until all [[java.lang.AutoCloseable]] returned by [[cache]] method are closed.
-      *
-      * @group slow
-      */
-    def cache(): AutoCloseable = {
-      sealed trait State
-      case object Openning extends State
-      case object EarlyClosed extends State
-      case object Closed extends State
-      final case class Open(release: UnitContinuation[Unit]) extends State
-
-      val state = new AtomicReference[State](Openning) with AutoCloseable {
-        @tailrec
-        final def close(): Unit = {
-          get match {
-            case Openning =>
-              if (compareAndSet(Openning, EarlyClosed)) {
-                // Success
-              } else {
-                close()
-              }
-            case oldState @ Open(release) =>
-              if (compareAndSet(oldState, Closed)) {
-                release.safeOnComplete { _: Unit =>
-                  Trampoline.done(())
-                }.run
-              } else {
-                close()
-              }
-            case EarlyClosed | Closed =>
-              throw new IllegalStateException("The resources associated to this tensor has been released.")
-          }
-        }
-      }
-
-      doBuffer.safeOnComplete { resource =>
-        @tailrec
-        def retry(): Trampoline[Unit] = {
-          state.get() match {
-            case EarlyClosed =>
-              if (state.compareAndSet(EarlyClosed, Closed)) {
-                resource.release.safeOnComplete { _: Unit =>
-                  Trampoline.done(())
-                }
-              } else {
-                retry()
-              }
-            case Openning =>
-              if (state.compareAndSet(Openning, Open(resource.release))) {
-                Trampoline.done(())
-              } else {
-                retry()
-              }
-            case _: Open | Closed =>
-              throw new IllegalStateException()
-          }
-        }
-        retry()
-      }.run
-
-      state
     }
 
   }
