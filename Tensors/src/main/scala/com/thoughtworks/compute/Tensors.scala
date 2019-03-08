@@ -395,6 +395,55 @@ trait Tensors extends OpenCL {
   object Tensor {
 
     @transient
+    private lazy val gridSampleProgram: Program = {
+      val program = createProgramWithSource(fastraw"""
+      kernel void grid_sample_2d(global float const * const restrict images,
+                                 global float const * const restrict grid,
+                                 global float * const restrict output) {
+        const int number_of_images = get_global_size(0);
+        const int number_of_channels = get_global_size(1);
+        const int height = get_global_size(2);
+        const int width = get_global_size(3);
+
+        const int image_index = get_global_id(0);
+        const int channel_index = get_global_id(1);
+
+        #define image_index(y, x) (x + width * (y + height * channel_index))
+        #define batch_index(y, x) (x + width * (y + height * (channel_index + number_of_channels * image_index)))
+
+
+        const int y = get_global_id(2);
+        const int x = get_global_id(3);
+        const int output_index = batch_index(y, x);
+        const int u_index = output_index * 2 + 1;
+        const int v_index = output_index * 2;
+        const float u = grid[u_index];
+        const float v = grid[v_index];
+        const int top = (int)v;
+        const int bottom = top + 1;
+        const int left = (int)u;
+        const int right = left + 1;
+
+        const float bottom_weight = v % 1f;
+        const float right_weight = u % 1f;
+        const float top_weight = 1f - bottom_weight;
+        const float left_weight = 1f - top_weight;
+
+        output[output_index] =
+          images[image_index(top, left)] * top_weight * left_weight +
+          images[image_index(top, right)] * top_weight * right_weight +
+          images[image_index(bottom, left)] * bottom_weight * left_weight +
+          images[image_index(bottom, right)] * bottom_weight * right_weight;
+
+        #undef batch_index
+        #undef image_index
+      }
+      """)
+      program.build()
+      program
+    }
+
+    @transient
     private lazy val randomNormalProgram: Program = {
 
       val program = createProgramWithSource(fastraw"""
@@ -520,6 +569,18 @@ trait Tensors extends OpenCL {
             }
           }
         }.shared
+      }
+    }
+
+    def gridSample(images: Tensor, grid: Tensor): NonInlineTensor = {
+      new NonInlineTensor {
+        def shape: Array[Int] = images.shape
+
+        private[compute] def doBuffer: Do[PendingBuffer[closure.JvmValue]] = {
+          ???
+        }
+
+        def padding: Float = images.padding
       }
     }
 
